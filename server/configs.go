@@ -19,6 +19,7 @@ type AutoScale struct {
 	AsleepMOTD            string        `usage:"MOTD to display when auto-scaled down servers are accessed; if empty, no status will be served"`
 	LoadingMOTD           string        `usage:"MOTD to display while auto-scaled Docker servers are waking up; if empty, asleep status will be served"`
 	WakeKickMessage       string        `usage:"If set, a player logging in to a scaled-down or still waking server is immediately disconnected with this message while the server keeps waking up, instead of holding the login until the server is ready (the Java client gives up after about 30 seconds)"`
+	WakeHoldTimeout       time.Duration `default:"0s" usage:"If set, a player logging in to a scaled-down or still waking server is held for up to this long while the server wakes up and is then connected without having to rejoin. Keep-alive packets stop the Java client from giving up after about 30 seconds (1.13+; older clients are held for at most 25 seconds). If the server is still not ready, the player is disconnected with -auto-scale-wake-kick-message"`
 	Webhook               AutoScaleWebhookConfig
 }
 

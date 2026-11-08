@@ -47,6 +47,22 @@ const (
 
 var noDeadline time.Time
 
+const (
+	// defaultWakeHoldKeepAliveInterval is how often a held login gets a keep-alive. The Java client
+	// drops a connection that has received nothing for 30 seconds.
+	defaultWakeHoldKeepAliveInterval = 10 * time.Second
+	// defaultWakeHoldPollInterval is how often a held login checks whether its backend is reachable.
+	defaultWakeHoldPollInterval = time.Second
+	// wakeHoldLegacyLimit caps the hold for clients older than 1.13, which have no login plugin
+	// request to keep them waiting, so they are told the wake message before they time out.
+	wakeHoldLegacyLimit = 25 * time.Second
+	// wakeHoldChannel is the login plugin channel of the keep-alives. No client knows it, so every
+	// client answers "not understood", which is all that is needed.
+	wakeHoldChannel = "mc-router:wake_hold"
+)
+
+var errWakeHoldTimedOut = errors.New("backend did not become reachable while the login was held")
+
 type ActiveConnections struct {
 	sync.RWMutex
 	// activeConnections key is either a backend address or scaling target key depending on metrics usage
@@ -104,6 +120,8 @@ func NewConnector(ctx context.Context, routes IRoutes, downScaler IDownScaler, m
 		scaleActiveConnections:     NewActiveConnections(),
 		wakingServers:              NewActiveConnections(),
 		backendDialTimeout:         defaultBackendDialTimeout,
+		wakeHoldKeepAliveInterval:  defaultWakeHoldKeepAliveInterval,
+		wakeHoldPollInterval:       defaultWakeHoldPollInterval,
 	}
 }
 
@@ -149,6 +167,9 @@ type Connector struct {
 	asleepMOTD                 string
 	loadingMOTD                string
 	wakeKickMessage            string
+	wakeHoldTimeout            time.Duration
+	wakeHoldKeepAliveInterval  time.Duration
+	wakeHoldPollInterval       time.Duration
 	backendDialTimeout         time.Duration
 }
 
@@ -631,13 +652,22 @@ func (c *Connector) findAndConnectBackend(frontendConn net.Conn,
 			WithField("player", playerInfo).
 			WithField("serverAllowsPlayer", serverAllowsPlayer).
 			Debug("checked if player is allowed to wake up the server")
-		if serverAllowsPlayer && c.wakeKickMessage != "" &&
+		if serverAllowsPlayer && (c.wakeKickMessage != "" || c.wakeHoldTimeout > 0) &&
 			(backendHostPort == "" || c.isWakeInProgress(serverAddress) || !c.backendAcceptsConnections(backendHostPort)) {
-			c.wakeInBackground(serverAddress, scalingTarget, waker)
-			c.kickWhileWaking(frontendConn, clientAddr, serverAddress, playerInfo)
-			return
-		}
-		if serverAllowsPlayer && scalingTarget.StartScaling() {
+			wakeResult := c.wakeInBackground(serverAddress, scalingTarget, waker)
+			if c.wakeHoldTimeout <= 0 {
+				c.kickWhileWaking(frontendConn, clientAddr, serverAddress, playerInfo)
+				return
+			}
+			heldBackend, err := c.holdWhileWaking(frontendConn, clientAddr, serverAddress, playerInfo, clientProtocol, wakeResult)
+			if err != nil {
+				if errors.Is(err, errWakeHoldTimedOut) && c.wakeKickMessage != "" {
+					c.kickWhileWaking(frontendConn, clientAddr, serverAddress, playerInfo)
+				}
+				return
+			}
+			backendHostPort = heldBackend
+		} else if serverAllowsPlayer && scalingTarget.StartScaling() {
 
 			// Cancel down scaler if active before scale up
 			if c.downScaler != nil {
@@ -979,13 +1009,23 @@ func (c *Connector) UseWakeKickMessage(message string) {
 	c.wakeKickMessage = message
 }
 
+// UseWakeHoldTimeout configures how long a login to a scaled-down or waking backend is held,
+// with keep-alive packets, before giving up. Zero (the default) keeps the previous behavior: kick
+// right away when a wake kick message is set, otherwise hold without keep-alives.
+func (c *Connector) UseWakeHoldTimeout(timeout time.Duration) {
+	c.wakeHoldTimeout = timeout
+}
+
 // wakeInBackground starts waking the backend without tying it to a client connection, so a
-// player can be told to come back instead of waiting into the client's own timeout.
-func (c *Connector) wakeInBackground(serverAddress string, scalingTarget ScalingTarget, waker WakerFunc) {
+// player can be told to come back instead of waiting into the client's own timeout. If this call
+// started the wake, the returned channel receives the woken backend address and is closed when
+// the wake ends (without a value if it failed); it is nil when a wake was already in progress.
+func (c *Connector) wakeInBackground(serverAddress string, scalingTarget ScalingTarget, waker WakerFunc) <-chan string {
 	if !scalingTarget.StartScaling() {
 		// a wake (or scale down) of this target is already in progress
-		return
+		return nil
 	}
+	result := make(chan string, 1)
 	if c.downScaler != nil {
 		c.downScaler.Cancel(scalingTarget)
 	}
@@ -996,7 +1036,11 @@ func (c *Connector) wakeInBackground(serverAddress string, scalingTarget Scaling
 	c.wakingServers.Increment(serverAddress)
 
 	go func() {
+		defer close(result)
 		backendHostPort, err := waker(c.ctx)
+		if err == nil && backendHostPort != "" {
+			result <- backendHostPort
+		}
 		c.wakingServers.Decrement(serverAddress)
 		scalingTarget.EndScaling()
 		if err != nil {
@@ -1009,13 +1053,14 @@ func (c *Connector) wakeInBackground(serverAddress string, scalingTarget Scaling
 			"backendHostPort": backendHostPort,
 		}).Info("Woke up backend server")
 
-		// Normally the scale-down timer is armed when the last connection closes. The kicked
-		// player has no connection, so arm it here; otherwise a server whose player never
+		// Normally the scale-down timer is armed when the last connection closes. A kicked or
+		// still held player has no backend connection, so arm it here; otherwise a server whose player never
 		// comes back would stay up forever. A player that does come back cancels it again.
 		if c.downScaler != nil && c.scaleActiveConnections.GetCount(scalingTarget.ScalingKey()) <= 0 {
 			c.downScaler.Start(c.ctx, scalingTarget, c.routes)
 		}
 	}()
+	return result
 }
 
 func (c *Connector) kickWhileWaking(frontendConn net.Conn, clientAddr net.Addr, serverAddress string, playerInfo *PlayerInfo) {
@@ -1031,6 +1076,118 @@ func (c *Connector) kickWhileWaking(frontendConn net.Conn, clientAddr net.Addr, 
 		"serverAddress": serverAddress,
 		"player":        playerInfo,
 	}).Info("Disconnected player with wake-up message while backend starts")
+}
+
+// holdWhileWaking keeps a login to a waking backend open until the backend accepts connections and
+// returns its address. Clients that support it (1.13+) get a login plugin request every
+// wakeHoldKeepAliveInterval, which resets their read timeout; the router consumes their answers
+// itself, so the backend later sees an untouched login. Nothing is relayed while a request is
+// unanswered, so the backend's own login plugin requests (Forge, Velocity forwarding) never
+// overlap with ours. Returns errWakeHoldTimedOut once the hold timeout passes, or another error
+// when the client went away.
+//
+// wakeResult is the channel from wakeInBackground (nil when another connection started the wake);
+// the address a waker returns wins over the route's, since a scale-up webhook may override it.
+func (c *Connector) holdWhileWaking(frontendConn net.Conn, clientAddr net.Addr, serverAddress string, playerInfo *PlayerInfo, clientProtocol int, wakeResult <-chan string) (string, error) {
+	keepAlive := clientProtocol >= int(mcproto.ProtocolVersion1_13)
+	limit := c.wakeHoldTimeout
+	if !keepAlive && limit > wakeHoldLegacyLimit {
+		limit = wakeHoldLegacyLimit
+	}
+	logger := logrus.WithFields(logrus.Fields{
+		"client":        clientAddr,
+		"serverAddress": serverAddress,
+		"player":        playerInfo,
+		"limit":         limit,
+		"keepAlive":     keepAlive,
+	})
+	logger.Info("Holding login while backend wakes up")
+
+	start := time.Now()
+	deadline := start.Add(limit)
+	nextKeepAlive := start.Add(c.wakeHoldKeepAliveInterval)
+	var messageID int32
+	var wokenBackend string
+	ticker := time.NewTicker(c.wakeHoldPollInterval)
+	defer ticker.Stop()
+
+	for {
+		if wakeResult != nil {
+			select {
+			case addr, ok := <-wakeResult:
+				if ok {
+					wokenBackend = addr
+				}
+				wakeResult = nil
+			default:
+			}
+		}
+		if !c.isWakeInProgress(serverAddress) {
+			backend := wokenBackend
+			if backend == "" {
+				backend, _, _, _, _, _ = c.routes.FindBackendForServerAddress(c.ctx, serverAddress)
+			}
+			if backend != "" && c.backendAcceptsConnections(backend) {
+				logger.WithField("backendHostPort", backend).
+					WithField("held", time.Since(start).Round(time.Millisecond)).
+					Info("Backend woke up while login was held")
+				return backend, nil
+			}
+		}
+
+		now := time.Now()
+		if !now.Before(deadline) {
+			logger.Info("Backend still not reachable at the end of the login hold")
+			return "", errWakeHoldTimedOut
+		}
+		if keepAlive && !now.Before(nextKeepAlive) {
+			if err := c.sendWakeKeepAlive(frontendConn, clientAddr, messageID); err != nil {
+				logger.WithError(err).Info("Held client went away")
+				return "", err
+			}
+			messageID++
+			nextKeepAlive = now.Add(c.wakeHoldKeepAliveInterval)
+		}
+
+		select {
+		case <-c.ctx.Done():
+			return "", c.ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// sendWakeKeepAlive sends one login plugin request to a held client and consumes its answer.
+func (c *Connector) sendWakeKeepAlive(frontendConn net.Conn, clientAddr net.Addr, messageID int32) error {
+	_ = frontendConn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
+	if err := mcproto.WriteLoginPluginRequest(frontendConn, messageID, wakeHoldChannel, nil); err != nil {
+		return fmt.Errorf("failed to write keep-alive: %w", err)
+	}
+	_ = frontendConn.SetWriteDeadline(noDeadline)
+
+	// Read straight from the connection, not through the inspection buffer: the answer is ours
+	// and must not be replayed to the backend.
+	_ = frontendConn.SetReadDeadline(time.Now().Add(c.wakeHoldKeepAliveInterval))
+	frame, err := mcproto.ReadFrame(frontendConn, clientAddr)
+	if err != nil {
+		return fmt.Errorf("failed to read keep-alive answer: %w", err)
+	}
+	payload := bytes.NewReader(frame.Payload)
+	packetID, err := mcproto.ReadVarInt(payload)
+	if err != nil {
+		return fmt.Errorf("failed to read keep-alive answer: %w", err)
+	}
+	if packetID != mcproto.PacketIdLoginPluginResponse {
+		return fmt.Errorf("expected a login plugin response to the keep-alive, got packet %#x", packetID)
+	}
+	answeredID, err := mcproto.ReadVarInt(payload)
+	if err != nil {
+		return fmt.Errorf("failed to read keep-alive answer: %w", err)
+	}
+	if int32(answeredID) != messageID {
+		return fmt.Errorf("keep-alive answer has message ID %d, expected %d", answeredID, messageID)
+	}
+	return nil
 }
 
 // backendAcceptsConnections reports whether a backend that has an address accepts a TCP

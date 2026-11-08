@@ -42,6 +42,8 @@ Some other features included:
     	MOTD to display while auto-scaled Docker servers are waking up; if empty, asleep status will be served (env AUTO_SCALE_LOADING_MOTD)
   -auto-scale-up
     	Scale from zero on access. For Kubernetes, increases StatefulSet replicas from 0 to 1. For Docker, starts or unpauses the container when accessed (env AUTO_SCALE_UP)
+  -auto-scale-wake-hold-timeout duration
+    	If set, a player logging in to a scaled-down or still waking server is held for up to this long while the server wakes up and is then connected without having to rejoin. Keep-alive packets stop the Java client from giving up after about 30 seconds (1.13+; older clients are held for at most 25 seconds). If the server is still not ready, the player is disconnected with -auto-scale-wake-kick-message (env AUTO_SCALE_WAKE_HOLD_TIMEOUT)
   -auto-scale-wake-kick-message string
     	If set, a player logging in to a scaled-down or still waking server is immediately disconnected with this message while the server keeps waking up, instead of holding the login until the server is ready (the Java client gives up after about 30 seconds) (env AUTO_SCALE_WAKE_KICK_MESSAGE)
   -auto-scale-webhook-headers value
@@ -352,7 +354,7 @@ These are the labels on the containers are scanned for discovery and auto-scalin
 - `mc-router.auto-scale-down`: Per-container/service override to enable/disable auto scale down for Docker/Swarm. When true (or left unspecified and the global `-auto-scale-down` flag is enabled), mc-router will stop the container or scale down the Swarm service to 0 after it has been idle.
 - `mc-router.auto-scale-asleep-motd`: Per-container/service override for MOTD to show when scaled to zero. If empty or not set the host will appear unresponsive.
 - `mc-router.auto-scale-loading-motd`: Per-container/service override for MOTD to show while waking up. Supports replacing the `{duration}` token with the remaining Swarm restart delay if the task is waiting to retry. If empty or not set, the global `-auto-scale-loading-motd` value is used.
-- `mc-router.auto-scale-wait-timeout`: Configure the maximum duration the router waits for the container or Swarm task to become reachable after scaling up (e.g. `"5m"` or `"300s"`). Defaults to 60s. Note: Since the Minecraft Java client has a strict connection timeout of 30 seconds, configuring this value above 30s is not recommended for player join connections.
+- `mc-router.auto-scale-wait-timeout`: Configure the maximum duration the router waits for the container or Swarm task to become reachable after scaling up (e.g. `"5m"` or `"300s"`). Defaults to 60s. Note: Since the Minecraft Java client has a strict connection timeout of 30 seconds, configuring this value above 30s is not recommended for player join connections, unless `-auto-scale-wake-hold-timeout` keeps them alive.
 - `mc-router.auto-scale-restart-delay-motd`: MOTD to show while the service is in a temporary restart delay (e.g. `"Server failed to start. Retrying in {duration}."`). Supports the `{duration}` countdown token, which dynamically updates.
 - `mc-router.auto-scale-failed-motd`: MOTD to show if the container/service fails to start permanently or Swarm exhausts its restart policy (e.g. `"Server crashed and stopped retrying."`). Does not support the countdown token.
 
@@ -380,6 +382,7 @@ Behavior:
 - While that wake-up is in progress and status pings are received, mc-router can return a loading MOTD (per-container override or `-auto-scale-loading-motd`).
 - When no clients remain connected and the idle timer elapses (`-auto-scale-down-after`), mc-router gracefully stops the container.
 - With `-auto-scale-wake-kick-message` set, a login to a stopped or still waking container is answered right away with a disconnect screen showing that message, while the container keeps starting in the background. Without it, the login is held until the container is reachable, which can exceed the Java client's ~30 second timeout. A server woken this way is scheduled to scale down like any other, even if the player never comes back.
+- With `-auto-scale-wake-hold-timeout` set (e.g. `3m`), such a login is held instead while the container starts, and the player joins as soon as it is reachable, without rejoining. Every 10 seconds the router sends the client a login plugin request on the `mc-router:wake_hold` channel and consumes the "not understood" answer itself, which keeps the Java client (1.13+, vanilla and modded) from timing out; the backend sees the untouched login. Clients older than 1.13 have no such packet and are held for at most 25 seconds. If the container is still not reachable when the hold ends, the player gets the `-auto-scale-wake-kick-message` (or the connection is closed if none is set).
 
 > [!NOTE]
 > Native Swarm service scaling via `-auto-scale-up`/`-auto-scale-down` is supported in both VIP (Virtual IP) and DNSRR (DNS Round-Robin) modes. Bypassing the VIP (by routing directly to the task container IP) is automatically enabled when `replicas == 1` to prevent VIP routing delay. Note that DNSRR mode has not been actively tested.
@@ -704,7 +707,7 @@ To override the MOTD shown when the server is scaled down or scaling up, you can
 - `mc-router.itzg.me/autoScaleLoadingMOTD`
 
 You can also customize how long the router will wait for a scaling backend to become reachable (default: 60s):
-- `mc-router.itzg.me/autoScaleWaitTimeout` (e.g. `2m`, `30s`). Note: Since the Minecraft Java client has a strict connection timeout of 30 seconds, configuring this value above 30s is not recommended for player join connections.
+- `mc-router.itzg.me/autoScaleWaitTimeout` (e.g. `2m`, `30s`). Note: Since the Minecraft Java client has a strict connection timeout of 30 seconds, configuring this value above 30s is not recommended for player join connections, unless `-auto-scale-wake-hold-timeout` keeps them alive.
 
 Example server with custom MOTD and timeout:
 ```yaml

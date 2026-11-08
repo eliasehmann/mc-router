@@ -119,6 +119,7 @@ func NewServer(ctx context.Context, config *Config) (*Server, error) {
 	connector.UseAsleepMOTD(config.AutoScale.AsleepMOTD)
 	connector.UseLoadingMOTD(config.AutoScale.LoadingMOTD)
 	connector.UseWakeKickMessage(config.AutoScale.WakeKickMessage)
+	connector.UseWakeHoldTimeout(config.AutoScale.WakeHoldTimeout)
 
 	clientFilter, err := NewClientFilter(config.ClientsToAllow, config.ClientsToDeny)
 	if err != nil {
