@@ -27,6 +27,9 @@ type RouteOptions struct {
 	AsleepMOTD    string
 	LoadingMOTD   string
 	ProxyProtocol *bool
+	// ScaleDownAfter overrides the global scale-down delay for the route's scaling target; zero
+	// means the global delay applies
+	ScaleDownAfter time.Duration
 }
 
 var tcpShieldPattern = regexp.MustCompile("///.*")
@@ -187,6 +190,8 @@ func (r *routesImpl) SetDefaultRoute(backend string, scalingTarget ScalingTarget
 	for _, listener := range r.routesListeners {
 		listener.OnDefaultRouteSet(backend)
 	}
+
+	r.useScaleDownDelay(scalingTarget, options)
 
 	// Trigger auto-scale down for default route on creation, same as CreateMapping.
 	if r.downScaler != nil && scalingTarget != nil && backend != "" {
@@ -431,6 +436,10 @@ func (r *routesImpl) RemoveMapping(serverAddress string) bool {
 			r.downScaler.Cancel(m.scalingTarget)
 		}
 		delete(r.mappings, serverAddress)
+		// Forget the target's scale-down delay unless another route still uses the target
+		if m.scalingTarget != nil && !r.isScalingTargetRouted(m.scalingTarget) {
+			r.useScaleDownDelay(m.scalingTarget, RouteOptions{})
+		}
 
 		for _, listener := range r.routesListeners {
 			listener.OnRouteRemoved(serverAddress)
@@ -458,6 +467,26 @@ func (r *routesImpl) sharedTarget(scalingTarget ScalingTarget) ScalingTarget {
 	return scalingTarget
 }
 
+// isScalingTargetRouted reports whether any route, the default route included, uses a target with
+// the same ScalingKey. Caller must hold a lock.
+func (r *routesImpl) isScalingTargetRouted(scalingTarget ScalingTarget) bool {
+	key := scalingTarget.ScalingKey()
+	for _, m := range r.mappings {
+		if m.scalingTarget != nil && m.scalingTarget.ScalingKey() == key {
+			return true
+		}
+	}
+	return r.defaultRoute != nil && r.defaultRoute.scalingTarget != nil && r.defaultRoute.scalingTarget.ScalingKey() == key
+}
+
+// useScaleDownDelay tells the down scaler which delay the options ask for, where zero stands for
+// the global delay. Caller must hold the write lock.
+func (r *routesImpl) useScaleDownDelay(scalingTarget ScalingTarget, options RouteOptions) {
+	if r.downScaler != nil && scalingTarget != nil {
+		r.downScaler.UseDelay(scalingTarget, options.ScaleDownAfter)
+	}
+}
+
 func (r *routesImpl) CreateMapping(serverAddress string, backend string, scalingTarget ScalingTarget, options RouteOptions) {
 	r.Lock()
 	defer r.Unlock()
@@ -483,6 +512,8 @@ func (r *routesImpl) CreateMapping(serverAddress string, backend string, scaling
 	for _, listener := range r.routesListeners {
 		listener.OnRouteAdded(serverAddress, backend)
 	}
+
+	r.useScaleDownDelay(scalingTarget, options)
 
 	// Trigger auto-scale down when a mapping first makes a scaling target routable to ensure servers
 	// are shut down if the router restarts. Re-registering an already-routable target must preserve
@@ -523,6 +554,8 @@ func (r *routesImpl) UpdateMapping(serverAddress string, backend string, scaling
 		listener.OnRouteRemoved(serverAddress)
 		listener.OnRouteAdded(serverAddress, backend)
 	}
+
+	r.useScaleDownDelay(scalingTarget, options)
 
 	if r.downScaler != nil && scalingTarget != nil {
 		// Cancel the timer when the backend disappears (container stopped externally).

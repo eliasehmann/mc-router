@@ -14,6 +14,10 @@ import (
 type IDownScaler interface {
 	Reset()
 	Start(ctx context.Context, scalingTarget ScalingTarget, routes IRoutes)
+	// UseDelay overrides the scale-down delay for the given scaling target. A delay of zero
+	// removes the override, so the target goes back to the default delay. A timer that is
+	// already running keeps the delay it was started with.
+	UseDelay(scalingTarget ScalingTarget, delay time.Duration)
 	Cancel(scalingTarget ScalingTarget)
 	HandleContextDone(ctx context.Context)
 }
@@ -22,6 +26,7 @@ func NewDownScaler(enabled bool, delay time.Duration) IDownScaler {
 	return &downScalerImpl{
 		enabled: enabled,
 		delay:   delay,
+		delays:  make(map[string]time.Duration),
 		timers:  make(map[string]*time.Timer),
 	}
 }
@@ -30,7 +35,9 @@ type downScalerImpl struct {
 	sync.Mutex
 	enabled bool
 	delay   time.Duration
-	timers  map[string]*time.Timer
+	// delays holds the per-target overrides of delay, keyed like timers
+	delays map[string]time.Duration
+	timers map[string]*time.Timer
 }
 
 func (ds *downScalerImpl) Reset() {
@@ -41,6 +48,18 @@ func (ds *downScalerImpl) Reset() {
 		t.Stop()
 	}
 	ds.timers = make(map[string]*time.Timer)
+	ds.delays = make(map[string]time.Duration)
+}
+
+func (ds *downScalerImpl) UseDelay(scalingTarget ScalingTarget, delay time.Duration) {
+	ds.Lock()
+	defer ds.Unlock()
+
+	if delay > 0 {
+		ds.delays[scalingTarget.ScalingKey()] = delay
+	} else {
+		delete(ds.delays, scalingTarget.ScalingKey())
+	}
 }
 
 func (ds *downScalerImpl) Start(ctx context.Context, scalingTarget ScalingTarget, routes IRoutes) {
@@ -57,11 +76,16 @@ func (ds *downScalerImpl) Start(ctx context.Context, scalingTarget ScalingTarget
 		return
 	}
 
+	delay, overridden := ds.delays[key]
+	if !overridden {
+		delay = ds.delay
+	}
+
 	logrus.WithField("scalingTarget", scalingTarget).
-		WithField("delay", ds.delay).
+		WithField("delay", delay).
 		Debug("Starting scale-down timer")
 
-	ds.timers[key] = time.AfterFunc(ds.delay, func() {
+	ds.timers[key] = time.AfterFunc(delay, func() {
 		ds.Lock()
 		delete(ds.timers, key)
 		ds.Unlock()

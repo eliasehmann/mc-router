@@ -350,6 +350,7 @@ These are the labels on the containers are scanned for discovery and auto-scalin
 - `mc-router.network`: Specify the network you are using for the router if multiple are present in the container/service. You can either use the network ID, it's full name or an alias. For Docker containers, `-docker-network` sets a default for all containers without this label.
 - `mc-router.auto-scale-up`: Per-container/service override to enable/disable auto scale up for Docker/Swarm. When true (or left unspecified and the global `-auto-scale-up` flag is enabled), mc-router will start the container or scale up the Swarm service when a client connects.
 - `mc-router.auto-scale-down`: Per-container/service override to enable/disable auto scale down for Docker/Swarm. When true (or left unspecified and the global `-auto-scale-down` flag is enabled), mc-router will stop the container or scale down the Swarm service to 0 after it has been idle.
+- `mc-router.auto-scale-down-after`: Per-container/service override of the global `-auto-scale-down-after` idle delay (e.g. `"12h"` or `"90s"`), for servers that should stay up longer or shorter than the others. Takes effect the next time the idle timer starts.
 - `mc-router.auto-scale-asleep-motd`: Per-container/service override for MOTD to show when scaled to zero. If empty or not set the host will appear unresponsive.
 - `mc-router.auto-scale-loading-motd`: Per-container/service override for MOTD to show while waking up. Supports replacing the `{duration}` token with the remaining Swarm restart delay if the task is waiting to retry. If empty or not set, the global `-auto-scale-loading-motd` value is used.
 - `mc-router.auto-scale-wait-timeout`: Configure the maximum duration the router waits for the container or Swarm task to become reachable after scaling up (e.g. `"5m"` or `"300s"`). Defaults to 60s. Note: Since the Minecraft Java client has a strict connection timeout of 30 seconds, configuring this value above 30s is not recommended for player join connections.
@@ -702,6 +703,9 @@ metadata:
 To override the MOTD shown when the server is scaled down or scaling up, you can use the following annotations on the `Service object`:
 - `mc-router.itzg.me/autoScaleAsleepMOTD`
 - `mc-router.itzg.me/autoScaleLoadingMOTD`
+
+To give a server its own idle delay before it is scaled down, instead of the global `-auto-scale-down-after`, use the following annotation on the `Service` object. It takes effect the next time the idle timer starts:
+- `mc-router.itzg.me/autoScaleDownAfter` (e.g. `12h`, `90s`)
 
 You can also customize how long the router will wait for a scaling backend to become reachable (default: 60s):
 - `mc-router.itzg.me/autoScaleWaitTimeout` (e.g. `2m`, `30s`). Note: Since the Minecraft Java client has a strict connection timeout of 30 seconds, configuring this value above 30s is not recommended for player join connections.

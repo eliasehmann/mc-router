@@ -34,6 +34,7 @@ const (
 	AnnotationAutoScaleAsleepMOTD  = "mc-router.itzg.me/autoScaleAsleepMOTD"
 	AnnotationAutoScaleLoadingMOTD = "mc-router.itzg.me/autoScaleLoadingMOTD"
 	AnnotationAutoScaleWaitTimeout = "mc-router.itzg.me/autoScaleWaitTimeout"
+	AnnotationAutoScaleDownAfter   = "mc-router.itzg.me/autoScaleDownAfter"
 )
 
 // K8sWatcher is a RouteFinder that can find routes from kubernetes services.
@@ -220,11 +221,12 @@ func (w *K8sWatcher) handleUpdate(oldObj any, newObj any) {
 	for _, newRS := range newServices {
 		logrus.WithFields(logrus.Fields{"new": newRS}).Debug("UPDATE")
 		options := RouteOptions{
-			Waker:         newRS.autoScaleUp,
-			Sleeper:       newRS.autoScaleDown,
-			AsleepMOTD:    newRS.autoScaleAsleepMOTD,
-			LoadingMOTD:   newRS.autoScaleLoadingMOTD,
-			ProxyProtocol: newRS.proxyProtocol,
+			Waker:          newRS.autoScaleUp,
+			Sleeper:        newRS.autoScaleDown,
+			AsleepMOTD:     newRS.autoScaleAsleepMOTD,
+			LoadingMOTD:    newRS.autoScaleLoadingMOTD,
+			ProxyProtocol:  newRS.proxyProtocol,
+			ScaleDownAfter: newRS.autoScaleDownAfter,
 		}
 		if newRS.externalServiceName != "" {
 			w.routesHandler.UpdateMapping(newRS.externalServiceName, newRS.containerEndpoint, newRS.scalingTarget, options)
@@ -258,11 +260,12 @@ func (w *K8sWatcher) handleAdd(obj any) {
 			logrus.WithField("routableService", routableService).Debug("ADD")
 
 			options := RouteOptions{
-				Waker:         routableService.autoScaleUp,
-				Sleeper:       routableService.autoScaleDown,
-				AsleepMOTD:    routableService.autoScaleAsleepMOTD,
-				LoadingMOTD:   routableService.autoScaleLoadingMOTD,
-				ProxyProtocol: routableService.proxyProtocol,
+				Waker:          routableService.autoScaleUp,
+				Sleeper:        routableService.autoScaleDown,
+				AsleepMOTD:     routableService.autoScaleAsleepMOTD,
+				LoadingMOTD:    routableService.autoScaleLoadingMOTD,
+				ProxyProtocol:  routableService.proxyProtocol,
+				ScaleDownAfter: routableService.autoScaleDownAfter,
 			}
 			if routableService.externalServiceName != "" {
 				w.routesHandler.CreateMapping(routableService.externalServiceName, routableService.containerEndpoint, routableService.scalingTarget, options)
@@ -281,6 +284,7 @@ type routableService struct {
 	autoScaleDown        SleeperFunc
 	autoScaleAsleepMOTD  string
 	autoScaleLoadingMOTD string
+	autoScaleDownAfter   time.Duration
 	proxyProtocol        *bool
 }
 
@@ -365,6 +369,15 @@ func (w *K8sWatcher) buildDetails(service *core.Service, externalServiceName str
 		}
 	}
 
+	var autoScaleDownAfter time.Duration
+	if afterStr, exists := service.Annotations[AnnotationAutoScaleDownAfter]; exists && afterStr != "" {
+		if parsedAfter, err := time.ParseDuration(afterStr); err == nil && parsedAfter > 0 {
+			autoScaleDownAfter = parsedAfter
+		} else {
+			logrus.WithError(err).WithField("service", service.Name).WithField("annotation", AnnotationAutoScaleDownAfter).WithField("value", afterStr).Warn("Invalid scale-down delay annotation, falling back to the global delay")
+		}
+	}
+
 	var proxyProtocol *bool
 	if value, exists := service.Annotations[AnnotationProxyProtocol]; exists {
 		enabled, err := discoveryconfig.ParseBool(value)
@@ -387,6 +400,7 @@ func (w *K8sWatcher) buildDetails(service *core.Service, externalServiceName str
 		autoScaleDown:        w.buildScaleFunction(service, 1, 0),
 		autoScaleAsleepMOTD:  autoScaleAsleepMOTD,
 		autoScaleLoadingMOTD: autoScaleLoadingMOTD,
+		autoScaleDownAfter:   autoScaleDownAfter,
 		proxyProtocol:        proxyProtocol,
 	}
 	return rs
