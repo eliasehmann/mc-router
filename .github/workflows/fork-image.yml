@@ -1,0 +1,36 @@
+# Fork only (not part of the upstream PR): builds this fork's image until upstream releases the
+# wake hold. Push a tag `hold-<upstream version>-<n>` to publish ghcr.io/<owner>/mc-router:<upstream version>-hold.<n>.
+name: fork-image
+
+on:
+  push:
+    tags: ["hold-*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: |
+          ref="${GITHUB_REF_NAME#hold-}"
+          echo "tag=${ref%-*}-hold.${ref##*-}" >>"$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/mc-router:${{ steps.tag.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
